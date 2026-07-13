@@ -1,90 +1,121 @@
 # AcademicFlow-Worker
 
-> **给 [AcademicFlow](https://nikki-su.github.io/AcademicFlow/) 用的 MinerU CORS 透传代理**
-> 部署到你自己的 Cloudflare 账号，30 秒完事，永久免费。
-
-## 为什么需要它？
-
-AcademicFlow 是纯前端工具，你的数据只在你自己的浏览器里。但 [MinerU](https://mineru.net) 的 API 不允许浏览器直接调用（服务端不返回 CORS 头），所以我们需要一个「中转站」把浏览器请求转发到 MinerU。
-
-**这个中转站部署在你自己的 Cloudflare 账号里，AcademicFlow 作者完全不接触。**
-
-数据流：
+MinerU HTTP API 的**透传代理**（无 CORS 头 → 浏览器直连挂）。同一份代码，两种 Runtime。
 
 ```
-你的浏览器  →  你的 Cloudflare Worker（纯转发，30 行代码）  →  mineru.net
-                     ↑
-              这个仓库，部署在你自己的 CF 账号
+用户浏览器 (nikki-su.github.io/AcademicFlow)
+       │
+       ▼
+用户自己部署的代理（Deno Deploy 或 Cloudflare Workers）
+       │
+       ▼
+       mineru.net
 ```
 
-Worker 不缓存、不落盘、不记录任何请求。你可以在 `src/worker.js` 里亲眼确认这不到 150 行代码在做什么。
+- **不缓存、不落盘、不上报**：只做纯转发，作者不接触任何数据
+- **凭证隔离**：MinerU token 在你浏览器 IndexedDB 里，请求经过你自己的代理
+- **无环境变量**：部署即用，代理里没有任何 secret
 
 ---
 
-## 一键部署（30 秒）
+## 选哪个方案？
+
+| | 🇨🇳 Deno Deploy | 🌍 Cloudflare Workers |
+|---|---|---|
+| **国内直连** | ✅ 三大运营商基本可达 | ❌ workers.dev 一般挂，需代理 |
+| **部署入口** | dash.deno.com（4 步网页配置） | Deploy Button 一键 |
+| **免费额度** | 100k requests/day | 100k requests/day |
+| **入口文件** | `src/deno.js` | `src/worker.js` |
+| **推荐给** | 国内用户（默认） | 有代理 / 出海用户 |
+
+两种方案都调用同一个 `src/core.js` 处理请求，功能 100% 等价，只差在跑在谁的机房。选一个部署即可。
+
+---
+
+## 方案 A：Deno Deploy 部署（国内用户，默认）
+
+1. 打开 <https://dash.deno.com/new>
+2. **Sign in with GitHub** → 授权 Deno Deploy 读取仓库
+3. **Deploy from GitHub repository** → 搜索 `AcademicFlow-Worker` → 选中
+   - **Entrypoint**：填 `src/deno.js`
+   - **Install Step**：留空
+   - **Build Step**：留空
+4. 点 **Deploy Project** → 得到 `https://<项目名>.deno.dev` URL
+
+粘回 AcademicFlow → Settings → MinerU 代理 输入框（部署方案选"国内网络"）。前端自动 ping `/__af_health`，绿色 ✓ 就是好了。
+
+---
+
+## 方案 B：Cloudflare Workers 一键部署（海外 / 有代理用户）
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Nikki-SU/AcademicFlow-Worker)
 
-**3 步流程：**
+1. 点上面按钮 → CF 登录（没账号会引导注册，仅需邮箱）
+2. 页面上直接点 **Deploy**，全程 CF 官方引导，无自定义步骤
+3. 得到 `https://<项目名>.<你的用户名>.workers.dev` URL
 
-1. 点上面按钮 → Cloudflare 登录（没账号会引导注册，只需邮箱+密码，全免费）
-2. 授权 CF 从这个 GitHub 仓库读取代码 → 页面自动 fork + 部署，你什么都不用配
-3. 部署完成后，页面顶部会显示你的 Worker URL（长这样：`https://academicflow-worker.你的用户名.workers.dev`）
-   - **复制这个 URL**，粘回 AcademicFlow 的 Settings → MinerU 代理 输入框
-   - 前端会自动 ping 一下，绿色 ✓ 就是好了
+粘回 AcademicFlow → Settings → MinerU 代理 输入框（部署方案选"海外/有代理"）。
 
-**下次刷新网页也不用再配了**，URL 保存在你的浏览器本地（IndexedDB）。
+> ⚠️ `*.workers.dev` 域名在国内三大运营商直连普遍不稳，若你在国内且没代理，请改用方案 A。
 
 ---
 
-## 免费额度够用吗？
+## 手动 / 本地开发（可选）
 
-Cloudflare Workers 免费版：
-- **每天 10 万次请求**
-- **每次请求 10ms CPU 时间**（纯转发用不到 1ms）
-
-一篇论文的 MinerU 流程大约 10 次请求（上传+轮询+下载）。**每天能处理 1 万篇论文**，一个人这辈子都用不完。
-
-超额了会怎样？Cloudflare 不会自动扣费，只会返回 429 让请求失败。你会知道，但不会掉钱。
-
----
-
-## 我担心 Worker 被别人滥用怎么办？
-
-- Worker 只转发两类请求：
-  - `/api/*` → 固定转发到 `mineru.net`
-  - `/proxy?url=<encoded>` → 只放行 `*.aliyuncs.com` / `*.openxlab.org.cn` / `mineru.net` 白名单（用于 MinerU 返回的 OSS 预签名 URL，PUT 上传 PDF + GET 下载 zip）
-- 其他路径直接 404，不会被当通用代理
-- URL 是随机域名 `xxx.workers.dev`，不主动公开就不会被扫到
-- 真被人蹭用最多蹭掉你的免费额度（10 万/天），不产生费用
-
-如果被滥用了想换 URL：CF 后台把这个 Worker 删了，重新点上面的一键部署按钮，粘新 URL 到 AcademicFlow 即可。
-
----
-
-## 想自己改代码？
-
-这仓库使用 MIT 协议，随便 fork 随便改。核心逻辑就 100 多行，一目了然：`src/worker.js`。
-
-改完之后：
+**Cloudflare Workers** 走 wrangler：
 ```bash
 npm install -g wrangler
 wrangler login
 wrangler deploy
 ```
 
+**Deno Deploy** 也支持 `deployctl` CLI，但网页部署更省事，一般不需要。
+
+**本地起 Deno server 调试**：
+```bash
+deno run --allow-net src/deno.js
+# 默认监听 8000 端口
+curl http://localhost:8000/__af_health
+```
+
+---
+
+## 路由
+
+| Path | 用途 |
+|---|---|
+| `GET /__af_health` | 健康检查（返回 `{ok, service, version, runtime, upstream}`） |
+| `ANY /api/v4/*` | 透传到 `https://mineru.net/api/v4/*` |
+| `ANY /proxy?url=<encoded>` | 白名单透传（用于 MinerU 返回的 OSS 预签名 URL） |
+
+**`/proxy` 白名单**：只允许转发到 `*.aliyuncs.com` / `*.openxlab.org.cn` / `mineru.net`（MinerU 目前用阿里云 OSS + openxlab CDN）。
+
+**响应头**：始终附加 `Access-Control-Allow-Origin: *` + `Access-Control-Allow-Methods` + `Access-Control-Allow-Headers` 让浏览器放行。
+
+---
+
+## 免费额度
+
+- **Deno Deploy**：100k requests/day，1M requests/month，CPU 无严格限制
+- **Cloudflare Workers**：100k requests/day，10ms CPU/req
+
+个人日常使用 AcademicFlow（一天几十篇论文）远够。
+
 ---
 
 ## 隐私 & 责任
 
-- **AcademicFlow 作者不接触任何请求**（这个 Worker 部署在你自己的 CF 账号，与作者完全无关）
-- **Cloudflare 会看到请求**（转发经过 CF 网络是必然），但 CF 有自己的隐私声明，与作者无关
-- **MinerU 会看到请求**（这本来就是你在调 MinerU），去 [mineru.net](https://mineru.net) 看他们的隐私政策
+- 代理部署在**你自己的账号下**，作者不接触
+- 代码 <200 行（`src/core.js` + 两个入口 <30 行），可自行审计
+- 不缓存、不落盘、不上报请求体和响应体
+- MIT License，允许 fork 修改
 
-如果你对隐私要求极高，请自行审阅 `src/worker.js`（不到 150 行）确认它真的什么都不做。
+如果你希望进一步降低信任成本：
+- fork 到自己账号，用你自己 fork 的仓库地址部署（Deno Deploy 支持任意 GitHub 仓库）
+- 代码只有 200 行，肉眼审计即可
 
 ---
 
 ## LICENSE
 
-MIT © 2026 [Nikki-SU](https://github.com/Nikki-SU)
+MIT
