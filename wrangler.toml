@@ -1,0 +1,6 @@
+name = "academicflow-worker"
+main = "src/worker.js"
+compatibility_date = "2026-01-01"
+
+# 免费额度：每天 10 万请求 / 每次请求 10ms CPU
+# 对普通学术工作流用户绰绰有余（一篇论文 10 次左右请求）
