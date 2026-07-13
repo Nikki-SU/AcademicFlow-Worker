@@ -127,14 +127,25 @@ async function proxyForward(request, targetUrl) {
     outHeaders.set(k, v)
   }
 
-  const upstreamReq = new Request(targetUrl, {
+  // 关键：uploadFile / pollBatch / downloadZip 都可能带大 body（PDF 8MB+）。
+  // 必须用 stream pipe + duplex: 'half'，避免 Worker 在内存里 buffer 整个 body 再转发
+  // （Deno 默认会先消费完整 stream 才能 fetch upstream，跨国回源时这个 buffer 等待
+  //  容易撞 Deno Deploy 100s fetch 超时，浏览器端会抛 TypeError: Failed to fetch）。
+  // @ts-ignore - duplex 是 Deno 1.40+ / CF Workers 扩展属性
+  const init = {
     method: request.method,
     headers: outHeaders,
-    body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
     redirect: 'follow',
-  })
-
-  const upstreamRes = await fetch(upstreamReq)
+    duplex: 'half',
+  }
+  // GET/HEAD 不能带 body（Web 标准约束）
+  if (['GET', 'HEAD'].includes(request.method)) {
+    delete init.body
+    delete init.duplex
+  } else {
+    init.body = request.body
+  }
+  const upstreamRes = await fetch(targetUrl, init)
 
   const respHeaders = new Headers(upstreamRes.headers)
   for (const [k, v] of Object.entries(corsHeaders())) {
