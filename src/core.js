@@ -21,6 +21,20 @@
  *   报 "type mismatch for field files"。
  *   v9.1 修法：剥 Content-Type 只对 /proxy 路径生效（options.stripContentType=true），
  *   /api/v4/* 路径保留 Content-Type（options.stripContentType=false）。
+ *
+ * v9.2 修复期（2026-07-15）：
+ *   v9.1 用 edit_file 改了 4 处但只真改 1 处（proxyForward 签名 + options 解构），
+ *   其他 3 处（handleApi / handleProxy / 条件剥）没改。
+ *   v9.2 修法：write_file 整文件覆盖 334 行，确保 3 处修改都生效。
+ *
+ * v10 修复期（2026-07-15）：
+ *   v9.2 跑 8MB PDF 真实流量，申请 URL 成功（type mismatch 修好）+
+ *   /proxy 剥 Content-Type 真的生效（af-worker-content-type=(none)），
+ *   但 8MB PDF 上传 30.7s 拿到 504（v8 加的 30s timeout 触发）。
+ *   回看：v3 时代 01:09 那次 8MB PDF 跑了 95.3s 才 abort（v3 没显式 timeout，
+ *   是 Deno Deploy 或网络层自己的 timeout），说明 8MB PDF 偶发就是需要 >95s。
+ *   v10 修法：worker 显式 timeout 30s → 120s，覆盖 95s 最坏情况 + 余量。
+ *   保留 4 个 X-AF-Worker-* header + 504 观测机制（v8 的关键设计，不能丢）。
  */
 
 const UPSTREAM_API = 'https://mineru.net'
@@ -36,6 +50,12 @@ const PROXY_ALLOWED_SUFFIXES = [
   '.openxlab.org.cn',
   'mineru.net',
 ]
+
+// v10：worker 显式 fetch timeout 阈值。
+// 8MB PDF 在 worker ↔ OSS 网络下偶发需要 95s+（v3 时代 01:09 那次 95.3s abort 验证），
+// 30s 太短会让真实流量被误判 timeout。120s = 4 倍 30s，覆盖 95s 最坏情况 + 25s 余量。
+// 如果 120s 还不够（更极端网络），再考虑去掉 worker 端 timeout。
+const FETCH_TIMEOUT_MS = 120000
 
 /**
  * 主 handler：接收 Request，返回 Response。
@@ -165,24 +185,25 @@ async function proxyForward(request, targetUrl, options = {}) {
   // 避免发到 OSS 的 URL 字节级跟签名时输入不一致，触发 403 SignatureDoesNotMatch。
   // 字符串级 split，不依赖 URL parser，保证 parse-encoder 行为可控。
   // v7 同步：保留 v6 行为（不改 URL 字节级），但加观测。
-  // v8 修复期：fetch 加 30s timeout，timeout/abort 时主动构造 504 response + 4 个
+  // v8 修复期：fetch 加 timeout，timeout/abort 时主动构造 504 response + 4 个
   //   X-AF-Worker-* header，让 abort 模式也能观测（v7 之前 abort 模式 fetch fail
   //   拿不到 response，4 个 header 写不进 response，观测能力失效）。
-  //   行为变化：从"fetch 一直挂着直到上游/网络断开"变成"30s 主动放弃并返回 504"。
+  //   行为变化：从"fetch 一直挂着直到上游/网络断开"变成"120s 主动放弃并返回 504"。
   //   收益：abortable / observable（Rosa 看到 504 + 4 个 header 就能定位卡在哪）。
-  //   风险：如果正常 8MB PDF 上传本身要 >30s（OSS 抽风），会被误判 timeout。
-  //   阈值从 30s 起，后续按实测数据调（v8 第一次推先看 abort 模式是否仍复现）。
+  //   v10 修复期：timeout 30s → 120s。8MB PDF 在 worker ↔ OSS 网络下偶发需要 95s+
+  //   （v3 时代 01:09 那次 95.3s abort 验证），30s 太短会让真实流量被误判 timeout。
+  //   120s = 4 倍 30s，覆盖 95s 最坏情况 + 25s 余量。
   const stabilizedUrl = stabilizeSignatureUrl(targetUrl)
 
-  // v8：fetch 加 AbortController + 30s timeout
+  // v10：fetch 加 AbortController + 120s timeout（v8 是 30s，v10 调到 120s）
   const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 30000)
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
 
   // 关键：用 new Request 构造（URL 字符串不被 WHATWG parser 规范化）
   // + duplex: 'half'（流式 pipe 边收边发，砍掉 buffer 等待解决 100s 超时）。
-  // + signal: AbortController.signal（30s timeout）。
+  // + signal: AbortController.signal（120s timeout）。
   // 三者结合 = 既保留 URL 字符串原样（避免签名 decode/encode 漂移），
-  // 又避免 Deno 在内存里 buffer 完整 8MB 再转发，又让 30s 卡住主动放弃。
+  // 又避免 Deno 在内存里 buffer 完整 8MB 再转发，又让 120s 卡住主动放弃。
   // @ts-ignore - duplex 是 Deno 1.40+ 扩展属性
   const init = {
     method: request.method,
@@ -219,9 +240,9 @@ async function proxyForward(request, targetUrl, options = {}) {
       )
       return new Response(
         JSON.stringify({
-          error: 'worker fetch timeout (30s)',
+          error: `worker fetch timeout (${FETCH_TIMEOUT_MS / 1000}s)`,
           upstreamHost: new URL(stabilizedUrl).hostname,
-          reason: 'OSS 30s 内未完成响应，worker 主动放弃。',
+          reason: `OSS ${FETCH_TIMEOUT_MS / 1000}s 内未完成响应，worker 主动放弃。`,
         }),
         {
           status: 504,
