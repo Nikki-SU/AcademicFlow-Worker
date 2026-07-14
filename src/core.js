@@ -127,11 +127,12 @@ async function proxyForward(request, targetUrl) {
     outHeaders.set(k, v)
   }
 
-  // v6 修复期：把 targetUrl 的 query string 重新按 RFC 3986 unreserved 规则
+  // v7 修复期：把 targetUrl 的 query string 重新按 RFC 3986 unreserved 规则
   // 严格 encode 一次，绕开 new Request 路径下 WHATWG URL parser 对 query 的
   // decode-不重 encode 行为（%2B → '+'，%3D → '='，但 serializer 不还原），
   // 避免发到 OSS 的 URL 字节级跟签名时输入不一致，触发 403 SignatureDoesNotMatch。
   // 字符串级 split，不依赖 URL parser，保证 parse-encoder 行为可控。
+  // v7 同步：保留 v6 行为（不改 URL 字节级），但加观测。
   const stabilizedUrl = stabilizeSignatureUrl(targetUrl)
 
   // 关键：用 new Request 构造（URL 字符串不被 WHATWG parser 规范化）
@@ -164,10 +165,16 @@ async function proxyForward(request, targetUrl) {
   // X-AF-Worker-URL-In:  client 申请时通过 ?url= 传来的 targetUrl（worker 收到）
   // X-AF-Worker-URL-Out: worker 实际转发给 OSS 的 URL（stabilize 后）
   // X-AF-Worker-Status: OSS 响应 status
+  // v7 新增：X-AF-Worker-Content-Type = worker 实际发给 OSS 的 Content-Type
+  //   （用于诊断 403 signature 不匹配：如果 client 发 application/octet-stream
+  //   但 mineru 算 signature 时用 application/pdf，签名一定不匹配。
+  //   把这个值暴露出来，Rosa 跑一次 8MB PDF 就能看到真实情况，
+  //   不再凭"猜测的 50%"盲改 Content-Type。）
   // 三者字节级对比 = 403 根因直接定位。
   respHeaders.set('X-AF-Worker-URL-In', targetUrl)
   respHeaders.set('X-AF-Worker-URL-Out', stabilizedUrl)
   respHeaders.set('X-AF-Worker-Status', String(upstreamRes.status))
+  respHeaders.set('X-AF-Worker-Content-Type', outHeaders.get('Content-Type') ?? '(none)')
 
   return new Response(upstreamRes.body, {
     status: upstreamRes.status,
