@@ -14,6 +14,13 @@
  *   ANY  /proxy?url=<url>    白名单透传（用于 MinerU 返回的 OSS 预签名 URL）
  *
  * 不做的事：不缓存、不落盘、不上报请求体和响应体、不修改请求头/响应体。
+ *
+ * v9.1 修复期（2026-07-15）：
+ *   v9 在 proxyForward 里无条件剥 Content-Type，结果把 /api/v4/file-urls/batch
+ *   这种 application/json 请求也带沟里了——mineru 端不知道 body 是 JSON，
+ *   报 "type mismatch for field files"。
+ *   v9.1 修法：剥 Content-Type 只对 /proxy 路径生效（options.stripContentType=true），
+ *   /api/v4/* 路径保留 Content-Type（options.stripContentType=false）。
  */
 
 const UPSTREAM_API = 'https://mineru.net'
@@ -73,8 +80,15 @@ export async function handleRequest(request, ctx = {}) {
 }
 
 async function handleApi(request, url) {
-  const upstreamUrl = UPSTREAM_API + url.pathname + url.search
-  return proxyForward(request, upstreamUrl)
+  // /api/v4/* 透传到 mineru.net
+  // 重要：不要剥 Content-Type！
+  //   POST /api/v4/file-urls/batch 这种 application/json 请求，
+  //   剥了 Content-Type 后 mineru 端不知道 body 是 JSON，就报 type mismatch。
+  //   v9 失误：v9 在 proxyForward 里无条件剥 Content-Type，把 batch endpoint 也带沟里了。
+  //   v9.1 修复：剥 Content-Type 只对 /proxy 路径生效，/api/v4/* 保留。
+  return proxyForward(request, UPSTREAM_API + url.pathname + url.search, {
+    stripContentType: false,
+  })
 }
 
 async function handleProxy(request, url) {
@@ -110,7 +124,7 @@ async function handleProxy(request, url) {
     )
   }
 
-  return proxyForward(request, target)
+  return proxyForward(request, target, { stripContentType: true })
 }
 
 async function proxyForward(request, targetUrl, options = {}) {
@@ -125,10 +139,13 @@ async function proxyForward(request, targetUrl, options = {}) {
   //   解决方案：worker 转发到 OSS 时主动剥掉 Content-Type，OSS 算 signature 时 Content-Type 字段
   //   跟 mineru 一致都是空，signature 匹配 → 200。
   //   根因锁定：v8 跑 8MB PDF，af-worker-content-type=application/pdf（client 实际带的 Content-Type）
-  //   + af-worker-url-in == af-worker-url-out（URL 字节级 noop）+ af-worker-status=403
+  //   + af-worker-url-in == af-worker-url-url-out（URL 字节级 noop）+ af-worker-status=403
   //   → 排除 URL 字节级和透传行为，剩 Content-Type 不一致。
   //   验证依据：阿里云开发者社区 OSS signature 案例（client SDK 不算 Content-Type vs OSS 会用 Content-Type），
   //   https://developer.aliyun.com/article/659783
+  // v9.1 修复：剥 Content-Type 只对 /proxy 路径生效（options.stripContentType=true 时才剥），
+  //   /api/v4/* 路径必须保留 Content-Type（stripContentType=false），否则 POST application/json
+  //   body 无法被 mineru 解析。
   const outHeaders = new Headers()
   for (const [k, v] of request.headers.entries()) {
     const lower = k.toLowerCase()
@@ -137,8 +154,8 @@ async function proxyForward(request, targetUrl, options = {}) {
     if (lower.startsWith('x-forwarded-')) continue
     if (lower.startsWith('x-real-')) continue
     if (lower.startsWith('deno-')) continue
-    // v9 新增：剥 Content-Type（mineru 算 signature 不考虑 Content-Type，OSS 会用 → 不一致）
-    if (lower === 'content-type') continue
+    // v9 新增 / v9.1 改为条件剥：只对 /proxy 路径生效
+    if (stripContentType && lower === 'content-type') continue
     outHeaders.set(k, v)
   }
 
