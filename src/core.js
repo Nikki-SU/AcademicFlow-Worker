@@ -133,18 +133,31 @@ async function proxyForward(request, targetUrl) {
   // 避免发到 OSS 的 URL 字节级跟签名时输入不一致，触发 403 SignatureDoesNotMatch。
   // 字符串级 split，不依赖 URL parser，保证 parse-encoder 行为可控。
   // v7 同步：保留 v6 行为（不改 URL 字节级），但加观测。
+  // v8 修复期：fetch 加 30s timeout，timeout/abort 时主动构造 504 response + 4 个
+  //   X-AF-Worker-* header，让 abort 模式也能观测（v7 之前 abort 模式 fetch fail
+  //   拿不到 response，4 个 header 写不进 response，观测能力失效）。
+  //   行为变化：从"fetch 一直挂着直到上游/网络断开"变成"30s 主动放弃并返回 504"。
+  //   收益：abortable / observable（Rosa 看到 504 + 4 个 header 就能定位卡在哪）。
+  //   风险：如果正常 8MB PDF 上传本身要 >30s（OSS 抽风），会被误判 timeout。
+  //   阈值从 30s 起，后续按实测数据调（v8 第一次推先看 abort 模式是否仍复现）。
   const stabilizedUrl = stabilizeSignatureUrl(targetUrl)
+
+  // v8：fetch 加 AbortController + 30s timeout
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 30000)
 
   // 关键：用 new Request 构造（URL 字符串不被 WHATWG parser 规范化）
   // + duplex: 'half'（流式 pipe 边收边发，砍掉 buffer 等待解决 100s 超时）。
-  // 两者结合 = 既保留 URL 字符串原样（避免签名 decode/encode 漂移），
-  // 又避免 Deno 在内存里 buffer 完整 8MB 再转发。
+  // + signal: AbortController.signal（30s timeout）。
+  // 三者结合 = 既保留 URL 字符串原样（避免签名 decode/encode 漂移），
+  // 又避免 Deno 在内存里 buffer 完整 8MB 再转发，又让 30s 卡住主动放弃。
   // @ts-ignore - duplex 是 Deno 1.40+ 扩展属性
   const init = {
     method: request.method,
     headers: outHeaders,
     redirect: 'follow',
     duplex: 'half',
+    signal: controller.signal,
   }
   // GET/HEAD 不能带 body（Web 标准约束）
   if (['GET', 'HEAD'].includes(request.method)) {
@@ -153,7 +166,41 @@ async function proxyForward(request, targetUrl) {
     init.body = request.body
   }
   const upstreamReq = new Request(stabilizedUrl, init)
-  const upstreamRes = await fetch(upstreamReq)
+
+  let upstreamRes
+  try {
+    upstreamRes = await fetch(upstreamReq)
+  } catch (err) {
+    clearTimeout(timeoutId)
+    // v8：abort/timeout 时主动构造 504 response + 4 个 header，让 abort 模式可观测
+    if (err && (err.name === 'AbortError' || err.name === 'TimeoutError')) {
+      const respHeaders = new Headers()
+      for (const [k, v] of Object.entries(corsHeaders())) {
+        respHeaders.set(k, v)
+      }
+      respHeaders.set('X-AF-Worker-URL-In', targetUrl)
+      respHeaders.set('X-AF-Worker-URL-Out', stabilizedUrl)
+      respHeaders.set('X-AF-Worker-Status', '504')
+      respHeaders.set(
+        'X-AF-Worker-Content-Type',
+        outHeaders.get('Content-Type') ?? '(none)',
+      )
+      return new Response(
+        JSON.stringify({
+          error: 'worker fetch timeout (30s)',
+          upstreamHost: new URL(stabilizedUrl).hostname,
+          reason: 'OSS 30s 内未完成响应，worker 主动放弃。',
+        }),
+        {
+          status: 504,
+          statusText: 'Gateway Timeout',
+          headers: respHeaders,
+        },
+      )
+    }
+    throw err
+  }
+  clearTimeout(timeoutId)
 
   const respHeaders = new Headers(upstreamRes.headers)
   for (const [k, v] of Object.entries(corsHeaders())) {
