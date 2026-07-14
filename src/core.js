@@ -127,21 +127,12 @@ async function proxyForward(request, targetUrl) {
     outHeaders.set(k, v)
   }
 
-  // 调试日志（M3.6.3 修复期临时开启）：打印实际发给上游的 URL 和 headers，
-  // 用于定位 fetch(string) 路径下 WHATWG URL parser 是否会规范化 URL 字符串
-  // （例如把 Signature=xrpY%2B...%3D 改成 Signature=xrpY+...=，导致 403）。
-  // Worker 是 Rosa 私有 Deno 账号，log 不存在泄露风险。
-  console.log('[proxyForward] targetUrl:', targetUrl)
-  console.log(
-    '[proxyForward] outHeaders:',
-    JSON.stringify([...outHeaders.entries()]),
-  )
-  console.log(
-    '[proxyForward] body type:',
-    request.body ? 'stream' : 'null',
-    'method:',
-    request.method,
-  )
+  // v6 修复期：把 targetUrl 的 query string 重新按 RFC 3986 unreserved 规则
+  // 严格 encode 一次，绕开 new Request 路径下 WHATWG URL parser 对 query 的
+  // decode-不重 encode 行为（%2B → '+'，%3D → '='，但 serializer 不还原），
+  // 避免发到 OSS 的 URL 字节级跟签名时输入不一致，触发 403 SignatureDoesNotMatch。
+  // 字符串级 split，不依赖 URL parser，保证 parse-encoder 行为可控。
+  const stabilizedUrl = stabilizeSignatureUrl(targetUrl)
 
   // 关键：用 new Request 构造（URL 字符串不被 WHATWG parser 规范化）
   // + duplex: 'half'（流式 pipe 边收边发，砍掉 buffer 等待解决 100s 超时）。
@@ -160,14 +151,23 @@ async function proxyForward(request, targetUrl) {
   } else {
     init.body = request.body
   }
-  const upstreamReq = new Request(targetUrl, init)
+  const upstreamReq = new Request(stabilizedUrl, init)
   const upstreamRes = await fetch(upstreamReq)
-  console.log('[proxyForward] upstream status:', upstreamRes.status)
 
   const respHeaders = new Headers(upstreamRes.headers)
   for (const [k, v] of Object.entries(corsHeaders())) {
     respHeaders.set(k, v)
   }
+  // v6 诊断：把 worker 端关键信息通过 response header 回给前端 Debug Console。
+  // Access-Control-Expose-Headers: * 已设（见 corsHeaders），浏览器允许前端 JS 读取。
+  // 这层不依赖 Deno Deploy Logs（已证实该 UI 不显示 console.log）。
+  // X-AF-Worker-URL-In:  client 申请时通过 ?url= 传来的 targetUrl（worker 收到）
+  // X-AF-Worker-URL-Out: worker 实际转发给 OSS 的 URL（stabilize 后）
+  // X-AF-Worker-Status: OSS 响应 status
+  // 三者字节级对比 = 403 根因直接定位。
+  respHeaders.set('X-AF-Worker-URL-In', targetUrl)
+  respHeaders.set('X-AF-Worker-URL-Out', stabilizedUrl)
+  respHeaders.set('X-AF-Worker-Status', String(upstreamRes.status))
 
   return new Response(upstreamRes.body, {
     status: upstreamRes.status,
@@ -191,4 +191,75 @@ function json(obj, extraHeaders = {}, status = 200) {
     status,
     headers: { 'Content-Type': 'application/json', ...extraHeaders },
   })
+}
+
+// v6 utility：把 OSS 预签名 URL 的 query string 按 RFC 3986 unreserved 规则
+// 严格重 encode 一次。绕开 WHATWG URL parser 对 query 字符串的
+// decode-不重 encode 行为（parser 会把 %2B → '+'，%3D → '='，但 serializer
+// 不会把这些字符重新编码回 %HH 形式），保证 worker → OSS 这一步的 URL
+// 字节级跟 OSS 算 signature 时用的输入严格一致。
+//
+// 算法：
+//   1. 字符串级 split '?' 取 baseUrl + query
+//   2. split '&' 取 [key, value] 数组
+//   3. 每个 key/value decode 一次（decodeURIComponent）
+//   4. 按 RFC 3986 unreserved 字符集（A-Z a-z 0-9 - _ . ~）encode 一次
+//      → 非 unreserved 字符（'+' '=' '/' 等）变回 %HH
+//   5. 按 key 排序（跟 OSS canonicalized resource 算法一致）
+//   6. 拼回 baseUrl?key1=encodedValue1&key2=encodedValue2&...
+//
+// 副作用：值里字符如果是已经 %HH 形式（如 %2B），会先 decode 再 encode，
+// 字节级跟 mineru 当时算 signature 时的 URL 字节级对齐 → OSS 算 signature
+// 跟 mineru 算 signature 用同一输入 → 200。
+function stabilizeSignatureUrl(targetUrl) {
+  const queryStart = targetUrl.indexOf('?')
+  if (queryStart === -1) return targetUrl
+  const baseUrl = targetUrl.substring(0, queryStart)
+  const query = targetUrl.substring(queryStart + 1)
+
+  const pairs = query.split('&').map((kv) => {
+    const eq = kv.indexOf('=')
+    if (eq === -1) return [safeDecode(kv), '']
+    return [safeDecode(kv.substring(0, eq)), safeDecode(kv.substring(eq + 1))]
+  })
+
+  pairs.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+
+  const newQuery = pairs
+    .map(([k, v]) => `${encodeRfc3986(k)}=${encodeRfc3986(v)}`)
+    .join('&')
+
+  return `${baseUrl}?${newQuery}`
+}
+
+function safeDecode(s) {
+  try {
+    return decodeURIComponent(s)
+  } catch {
+    return s
+  }
+}
+
+// RFC 3986 unreserved 字符：A-Z a-z 0-9 - _ . ~
+// 其他字符（含 '+' '=' '/' '?' '&' '#' 等）一律 %HH，
+// UTF-8 多字节字符也走 UTF-8 → %HH（通过 TextEncoder 拿字节）。
+function encodeRfc3986(s) {
+  const bytes = new TextEncoder().encode(s)
+  let r = ''
+  for (const b of bytes) {
+    if (
+      (b >= 0x41 && b <= 0x5a) || // A-Z
+      (b >= 0x61 && b <= 0x7a) || // a-z
+      (b >= 0x30 && b <= 0x39) || // 0-9
+      b === 0x2d || // -
+      b === 0x5f || // _
+      b === 0x2e || // .
+      b === 0x7e    // ~
+    ) {
+      r += String.fromCharCode(b)
+    } else {
+      r += '%' + b.toString(16).toUpperCase().padStart(2, '0')
+    }
+  }
+  return r
 }
