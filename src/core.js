@@ -113,7 +113,8 @@ async function handleProxy(request, url) {
   return proxyForward(request, target)
 }
 
-async function proxyForward(request, targetUrl) {
+async function proxyForward(request, targetUrl, options = {}) {
+  const { stripContentType = false } = options
   // 复制请求头，剥掉 host / cf-* / x-forwarded-* / deno-* 等平台注入头
   // 避免污染上游签名和风控
   // v9 修复期：额外剥掉 Content-Type header。原因：mineru 算 OSS 预签名 URL signature 时
