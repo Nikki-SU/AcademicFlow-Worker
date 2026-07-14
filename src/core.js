@@ -116,6 +116,18 @@ async function handleProxy(request, url) {
 async function proxyForward(request, targetUrl) {
   // 复制请求头，剥掉 host / cf-* / x-forwarded-* / deno-* 等平台注入头
   // 避免污染上游签名和风控
+  // v9 修复期：额外剥掉 Content-Type header。原因：mineru 算 OSS 预签名 URL signature 时
+  //   StringToSign 的 Content-Type 字段是空（mineru 假定 client 不带 Content-Type），
+  //   但浏览器 fetch PUT 上传时会自动带 Content-Type（来自 file.type，对 PDF 是 application/pdf）。
+  //   worker 透传后，OSS 收到带 Content-Type 的请求，OSS 算 signature 时**会**用 Content-Type，
+  //   StringToSign Content-Type 字段变成 application/pdf，跟 mineru 算时的空不一致 → 403。
+  //   解决方案：worker 转发到 OSS 时主动剥掉 Content-Type，OSS 算 signature 时 Content-Type 字段
+  //   跟 mineru 一致都是空，signature 匹配 → 200。
+  //   根因锁定：v8 跑 8MB PDF，af-worker-content-type=application/pdf（client 实际带的 Content-Type）
+  //   + af-worker-url-in == af-worker-url-out（URL 字节级 noop）+ af-worker-status=403
+  //   → 排除 URL 字节级和透传行为，剩 Content-Type 不一致。
+  //   验证依据：阿里云开发者社区 OSS signature 案例（client SDK 不算 Content-Type vs OSS 会用 Content-Type），
+  //   https://developer.aliyun.com/article/659783
   const outHeaders = new Headers()
   for (const [k, v] of request.headers.entries()) {
     const lower = k.toLowerCase()
@@ -124,6 +136,8 @@ async function proxyForward(request, targetUrl) {
     if (lower.startsWith('x-forwarded-')) continue
     if (lower.startsWith('x-real-')) continue
     if (lower.startsWith('deno-')) continue
+    // v9 新增：剥 Content-Type（mineru 算 signature 不考虑 Content-Type，OSS 会用 → 不一致）
+    if (lower === 'content-type') continue
     outHeaders.set(k, v)
   }
 
